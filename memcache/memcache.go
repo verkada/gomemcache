@@ -136,6 +136,11 @@ type Client struct {
 	// If zero, DefaultTimeout is used.
 	Timeout time.Duration
 
+	// DialTimeout specifies the timeout for establishing new connections,
+	// including the TLS handshake if TLS is enabled.
+	// If zero, Timeout is used (for backward compatibility).
+	DialTimeout time.Duration
+
 	// MaxIdleConns specifies the maximum number of idle connections that will
 	// be maintained per address. If less than one, DefaultMaxIdleConns will be
 	// used.
@@ -237,6 +242,14 @@ func (c *Client) netTimeout() time.Duration {
 	return DefaultTimeout
 }
 
+func (c *Client) dialTimeout() time.Duration {
+	if c.DialTimeout != 0 {
+		return c.DialTimeout
+	}
+	// Fall back to Timeout for backward compatibility
+	return c.netTimeout()
+}
+
 func (c *Client) maxIdleConns() int {
 	if c.MaxIdleConns > 0 {
 		return c.MaxIdleConns
@@ -265,7 +278,7 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 		nc  net.Conn
 		err error
 	)
-	nd := net.Dialer{Timeout: c.netTimeout()}
+	nd := net.Dialer{Timeout: c.dialTimeout()}
 	if c.TlsConfig != nil {
 		nc, err = tls.DialWithDialer(&nd, addr.Network(), addr.String(), c.TlsConfig)
 	} else {
