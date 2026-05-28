@@ -469,3 +469,174 @@ func TestSeparateTimeouts(t *testing.T) {
 		t.Error("DialTimeout and Timeout should be independent")
 	}
 }
+
+// TestUseSplitTimeouts verifies the dialer takes the split-timeout path only
+// when ConnectTimeout or HandshakeTimeout is configured.
+func TestUseSplitTimeouts(t *testing.T) {
+	tests := []struct {
+		name     string
+		connect  time.Duration
+		handshk  time.Duration
+		expected bool
+	}{
+		{"neither set -> legacy", 0, 0, false},
+		{"connect set -> split", 50 * time.Millisecond, 0, true},
+		{"handshake set -> split", 0, 500 * time.Millisecond, true},
+		{"both set -> split", 50 * time.Millisecond, 500 * time.Millisecond, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{ConnectTimeout: tt.connect, HandshakeTimeout: tt.handshk}
+			if got := c.useSplitTimeouts(); got != tt.expected {
+				t.Errorf("useSplitTimeouts() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestSplitTimeoutFallbacks verifies connectTimeout()/handshakeTimeout() fall
+// back to dialTimeout() (and thence Timeout/DefaultTimeout) when unset.
+func TestSplitTimeoutFallbacks(t *testing.T) {
+	// Only handshake configured: connect should fall back to dialTimeout().
+	c := &Client{HandshakeTimeout: 800 * time.Millisecond, DialTimeout: 175 * time.Millisecond}
+	if got := c.connectTimeout(); got != 175*time.Millisecond {
+		t.Errorf("connectTimeout() fallback = %v, want 175ms", got)
+	}
+	if got := c.handshakeTimeout(); got != 800*time.Millisecond {
+		t.Errorf("handshakeTimeout() = %v, want 800ms", got)
+	}
+
+	// Only connect configured: handshake should fall back to dialTimeout().
+	c2 := &Client{ConnectTimeout: 50 * time.Millisecond, Timeout: 90 * time.Millisecond}
+	if got := c2.connectTimeout(); got != 50*time.Millisecond {
+		t.Errorf("connectTimeout() = %v, want 50ms", got)
+	}
+	// dialTimeout() with no DialTimeout falls back to netTimeout() == Timeout.
+	if got := c2.handshakeTimeout(); got != 90*time.Millisecond {
+		t.Errorf("handshakeTimeout() fallback = %v, want 90ms", got)
+	}
+}
+
+// TestOnDialHookSuccess verifies OnDial fires with timing on a successful
+// (non-TLS) connect via the split-timeout path.
+func TestOnDialHookSuccess(t *testing.T) {
+	fakeServer, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal("Could not open fake server: ", err)
+	}
+	defer fakeServer.Close()
+	go func() {
+		for {
+			conn, err := fakeServer.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(ioutil.Discard, conn) }()
+		}
+	}()
+
+	addr := fakeServer.Addr()
+	// OnDial fires on a separate goroutine, so receive its result over a channel.
+	dialCh := make(chan DialInfo, 1)
+	c := New(addr.String())
+	c.ConnectTimeout = 500 * time.Millisecond // force split path
+	c.OnDial = func(info DialInfo) { dialCh <- info }
+
+	if _, err := c.getConn(addr); err != nil {
+		t.Fatalf("failed to connect to fake server: %v", err)
+	}
+
+	var got DialInfo
+	select {
+	case got = <-dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnDial was not invoked within 2s")
+	}
+	if got.Err != nil {
+		t.Errorf("OnDial reported error on success: %v", got.Err)
+	}
+	if got.TLS {
+		t.Error("OnDial reported TLS for a non-TLS connection")
+	}
+	if got.ConnectDuration <= 0 {
+		t.Error("OnDial ConnectDuration should be positive")
+	}
+}
+
+// TestOnDialHookConnectFailure verifies OnDial fires with a ConnectTimeoutError
+// when the TCP connect fails, on the split-timeout path.
+func TestOnDialHookConnectFailure(t *testing.T) {
+	// 192.0.2.0/24 (TEST-NET-1) is reserved and non-routable: connect will time out.
+	const blackhole = "192.0.2.1:11211"
+	dialCh := make(chan DialInfo, 1)
+	c := New(blackhole)
+	c.ConnectTimeout = 50 * time.Millisecond // short, forces split path + fast timeout
+	c.OnDial = func(info DialInfo) { dialCh <- info }
+
+	addr, err := c.selector.PickServer("anykey")
+	if err != nil {
+		t.Fatalf("PickServer: %v", err)
+	}
+	_, derr := c.dial(addr)
+	if derr == nil {
+		t.Fatal("expected a connect failure, got nil")
+	}
+	if _, ok := derr.(*ConnectTimeoutError); !ok {
+		// Non-timeout connect errors are also acceptable on some networks, but a
+		// timeout is expected against a blackhole address.
+		t.Logf("got non-timeout dial error (acceptable): %v", derr)
+	}
+
+	var got DialInfo
+	select {
+	case got = <-dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnDial was not invoked within 2s")
+	}
+	if got.Err == nil {
+		t.Error("OnDial should have reported the failure error")
+	}
+	if got.ConnectDuration <= 0 {
+		t.Error("OnDial ConnectDuration should be positive even on failure")
+	}
+}
+
+// TestOnDialHookPanicRecovered verifies a panicking hook does not crash the
+// caller (the panic is recovered on the hook's goroutine).
+func TestOnDialHookPanicRecovered(t *testing.T) {
+	fakeServer, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal("Could not open fake server: ", err)
+	}
+	defer fakeServer.Close()
+	go func() {
+		for {
+			conn, err := fakeServer.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(ioutil.Discard, conn) }()
+		}
+	}()
+
+	addr := fakeServer.Addr()
+	done := make(chan struct{})
+	c := New(addr.String())
+	c.ConnectTimeout = 500 * time.Millisecond
+	c.OnDial = func(info DialInfo) {
+		defer close(done)
+		panic("boom")
+	}
+
+	// The dial must succeed even though the hook panics.
+	if _, err := c.getConn(addr); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook was not invoked within 2s")
+	}
+	// Give the recover() a moment; if the panic were not recovered, the test
+	// binary would have crashed by now.
+}

@@ -139,7 +139,37 @@ type Client struct {
 	// DialTimeout specifies the timeout for establishing new connections,
 	// including the TLS handshake if TLS is enabled.
 	// If zero, Timeout is used (for backward compatibility).
+	//
+	// DialTimeout is a single budget covering both the TCP connection and the
+	// TLS handshake. Because the TLS handshake can be slow when the server is
+	// under CPU pressure, a single tight budget can abort handshakes mid-flight.
+	// Prefer ConnectTimeout + HandshakeTimeout (below) to budget them
+	// separately; DialTimeout is retained for backward compatibility and is used
+	// only when the split timeouts are zero.
 	DialTimeout time.Duration
+
+	// ConnectTimeout, when non-zero, bounds only the TCP connection
+	// establishment (not the TLS handshake). Pair with HandshakeTimeout to
+	// budget connect and handshake independently. If zero, the dialer falls back
+	// to DialTimeout for the whole operation.
+	ConnectTimeout time.Duration
+
+	// HandshakeTimeout, when non-zero, bounds only the TLS handshake (separate
+	// from the TCP connect). Has no effect for non-TLS clients. If zero, the TLS
+	// handshake shares the DialTimeout/ConnectTimeout budget (legacy behavior).
+	HandshakeTimeout time.Duration
+
+	// OnDial, when non-nil, is invoked after every connection attempt (success
+	// or failure) with timing and outcome details. It enables callers to emit
+	// dial-count, connect/handshake-duration, and TLS-resumption metrics without
+	// the library taking a metrics dependency.
+	//
+	// OnDial is invoked on a separate goroutine so it can never add latency to
+	// the dial path; consequently it may run after the connection is already in
+	// use, and the relative ordering of callbacks is not guaranteed. A panic in
+	// the hook is recovered and discarded. The DialInfo is passed by value, so
+	// the hook owns its copy.
+	OnDial func(DialInfo)
 
 	// MaxIdleConns specifies the maximum number of idle connections that will
 	// be maintained per address. If less than one, DefaultMaxIdleConns will be
@@ -154,6 +184,24 @@ type Client struct {
 	lk        sync.Mutex
 	freeconn  map[string][]*conn
 	TlsConfig *tls.Config
+}
+
+// DialInfo reports the outcome of a single connection attempt to OnDial.
+type DialInfo struct {
+	// Addr is the server address that was dialed.
+	Addr net.Addr
+	// TLS is true if the attempt included a TLS handshake.
+	TLS bool
+	// ConnectDuration is the time spent establishing the TCP connection.
+	ConnectDuration time.Duration
+	// HandshakeDuration is the time spent on the TLS handshake. Zero for
+	// non-TLS attempts or when the connect failed before the handshake began.
+	HandshakeDuration time.Duration
+	// Resumed is true if the TLS handshake resumed a previous session
+	// (abbreviated handshake). Only meaningful when TLS is true and Err is nil.
+	Resumed bool
+	// Err is the failure, or nil on success.
+	Err error
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -268,12 +316,42 @@ func (cte *ConnectTimeoutError) Error() string {
 	return "memcache: connect timeout to " + cte.Addr.String()
 }
 
-func (c *Client) dial(addr net.Addr) (net.Conn, error) {
-	type connError struct {
-		cn  net.Conn
-		err error
-	}
+// useSplitTimeouts reports whether the caller configured independent connect
+// and handshake budgets. When false, dial uses the legacy single-budget path.
+func (c *Client) useSplitTimeouts() bool {
+	return c.ConnectTimeout != 0 || c.HandshakeTimeout != 0
+}
 
+// connectTimeout is the TCP-connect budget for the split-timeout path. It falls
+// back to dialTimeout() when ConnectTimeout is unset so a caller can configure
+// only HandshakeTimeout and still get a sane connect bound.
+func (c *Client) connectTimeout() time.Duration {
+	if c.ConnectTimeout != 0 {
+		return c.ConnectTimeout
+	}
+	return c.dialTimeout()
+}
+
+// handshakeTimeout is the TLS-handshake budget for the split-timeout path. It
+// falls back to dialTimeout() when HandshakeTimeout is unset.
+func (c *Client) handshakeTimeout() time.Duration {
+	if c.HandshakeTimeout != 0 {
+		return c.HandshakeTimeout
+	}
+	return c.dialTimeout()
+}
+
+func (c *Client) dial(addr net.Addr) (net.Conn, error) {
+	if c.useSplitTimeouts() {
+		return c.dialSplit(addr)
+	}
+	return c.dialLegacy(addr)
+}
+
+// dialLegacy preserves the original behavior: a single dialer Timeout covers
+// both the TCP connection and (for TLS) the handshake.
+func (c *Client) dialLegacy(addr net.Addr) (net.Conn, error) {
+	start := time.Now()
 	var (
 		nc  net.Conn
 		err error
@@ -284,13 +362,109 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	} else {
 		nc, err = nd.Dial(addr.Network(), addr.String())
 	}
+	err = c.normalizeDialErr(addr, err)
+	c.reportDial(DialInfo{
+		Addr:            addr,
+		TLS:             c.TlsConfig != nil,
+		ConnectDuration: time.Since(start),
+		Resumed:         resumedFrom(nc, err),
+		Err:             err,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return nc, nil
+}
+
+// dialSplit budgets the TCP connect and the TLS handshake independently, so a
+// slow handshake (e.g. a CPU-bound server) does not consume the connect budget
+// and a tight connect budget can fail a dead host fast without aborting healthy
+// but slow handshakes.
+func (c *Client) dialSplit(addr net.Addr) (net.Conn, error) {
+	connectStart := time.Now()
+	nd := net.Dialer{Timeout: c.connectTimeout()}
+	rawConn, err := nd.Dial(addr.Network(), addr.String())
+	connectDur := time.Since(connectStart)
+	if err != nil {
+		err = c.normalizeDialErr(addr, err)
+		c.reportDial(DialInfo{Addr: addr, TLS: c.TlsConfig != nil, ConnectDuration: connectDur, Err: err})
+		return nil, err
+	}
+
+	// Non-TLS: nothing more to do.
+	if c.TlsConfig == nil {
+		c.reportDial(DialInfo{Addr: addr, ConnectDuration: connectDur})
+		return rawConn, nil
+	}
+
+	// TLS: run the handshake under its own deadline.
+	handshakeStart := time.Now()
+	tlsConn := tls.Client(rawConn, c.TlsConfig)
+	if dl := c.handshakeTimeout(); dl > 0 {
+		_ = tlsConn.SetDeadline(time.Now().Add(dl))
+	}
+	herr := tlsConn.Handshake()
+	handshakeDur := time.Since(handshakeStart)
+	// Clear the handshake deadline; per-op deadlines are managed elsewhere.
+	_ = tlsConn.SetDeadline(time.Time{})
+	if herr != nil {
+		_ = tlsConn.Close()
+		herr = c.normalizeDialErr(addr, herr)
+		c.reportDial(DialInfo{
+			Addr:              addr,
+			TLS:               true,
+			ConnectDuration:   connectDur,
+			HandshakeDuration: handshakeDur,
+			Err:               herr,
+		})
+		return nil, herr
+	}
+	c.reportDial(DialInfo{
+		Addr:              addr,
+		TLS:               true,
+		ConnectDuration:   connectDur,
+		HandshakeDuration: handshakeDur,
+		Resumed:           tlsConn.ConnectionState().DidResume,
+	})
+	return tlsConn, nil
+}
+
+// normalizeDialErr maps a timeout to ConnectTimeoutError, matching legacy
+// behavior, and passes other errors through unchanged.
+func (c *Client) normalizeDialErr(addr net.Addr, err error) error {
 	if err == nil {
-		return nc, nil
+		return nil
 	}
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		return nil, &ConnectTimeoutError{addr}
+		return &ConnectTimeoutError{addr}
 	}
-	return nil, err
+	return err
+}
+
+// reportDial invokes the OnDial hook (if configured) on a separate goroutine so
+// a slow hook cannot add latency to the dial path. A panic in the hook is
+// recovered so it cannot crash the spawned goroutine (and thus the process).
+func (c *Client) reportDial(info DialInfo) {
+	hook := c.OnDial
+	if hook == nil {
+		return
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		hook(info)
+	}()
+}
+
+// resumedFrom reports whether a successful TLS connection resumed a session.
+// Returns false for failures or non-TLS connections.
+func resumedFrom(nc net.Conn, err error) bool {
+	if err != nil || nc == nil {
+		return false
+	}
+	if tc, ok := nc.(*tls.Conn); ok {
+		return tc.ConnectionState().DidResume
+	}
+	return false
 }
 
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
