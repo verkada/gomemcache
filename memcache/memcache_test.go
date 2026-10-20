@@ -469,3 +469,71 @@ func TestSeparateTimeouts(t *testing.T) {
 		t.Error("DialTimeout and Timeout should be independent")
 	}
 }
+
+func TestCloseIdleConnsClosesOnlyAddr(t *testing.T) {
+	listen := func() net.Listener {
+		l, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatal("Could not open fake server: ", err)
+		}
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go func() { io.Copy(ioutil.Discard, c) }()
+			}
+		}()
+		return l
+	}
+	l1, l2 := listen(), listen()
+	defer l1.Close()
+	defer l2.Close()
+	addr1, addr2 := l1.Addr(), l2.Addr()
+
+	c := New(addr1.String(), addr2.String())
+	var held []*conn
+	for _, addr := range []net.Addr{addr1, addr1, addr2} {
+		cn, err := c.getConn(addr)
+		if err != nil {
+			t.Fatalf("getConn(%s): %v", addr, err)
+		}
+		held = append(held, cn)
+	}
+	for _, cn := range held {
+		cn.release()
+	}
+	if got := len(c.freeconn[addr1.String()]); got != 2 {
+		t.Fatalf("idle conns to addr1 = %d, want 2", got)
+	}
+	closed := c.freeconn[addr1.String()]
+	kept := c.freeconn[addr2.String()]
+
+	if err := c.CloseIdleConns(addr1); err != nil {
+		t.Fatalf("CloseIdleConns: %v", err)
+	}
+
+	if got := len(c.freeconn[addr1.String()]); got != 0 {
+		t.Errorf("idle conns to addr1 after CloseIdleConns = %d, want 0", got)
+	}
+	if got := len(c.freeconn[addr2.String()]); got != 1 {
+		t.Errorf("idle conns to addr2 after CloseIdleConns = %d, want 1", got)
+	}
+	for _, cn := range closed {
+		if _, err := cn.nc.Write([]byte("x")); err == nil {
+			t.Error("idle conn to addr1 still open after CloseIdleConns")
+		}
+	}
+	for _, cn := range kept {
+		if _, err := cn.nc.Write([]byte("x")); err != nil {
+			t.Errorf("idle conn to addr2 closed by CloseIdleConns(addr1): %v", err)
+		}
+	}
+
+	cn, err := c.getConn(addr1)
+	if err != nil {
+		t.Fatalf("getConn(addr1) after CloseIdleConns: %v", err)
+	}
+	cn.release()
+}

@@ -779,6 +779,22 @@ func (c *Client) Close() error {
 	return ret
 }
 
+// CloseIdleConns closes the idle connections to addr and leaves those to
+// other servers open. The client stays usable and dials addr again on demand.
+func (c *Client) CloseIdleConns(addr net.Addr) error {
+	c.lk.Lock()
+	conns := c.freeconn[addr.String()]
+	delete(c.freeconn, addr.String())
+	c.lk.Unlock()
+	var ret error
+	for _, cn := range conns {
+		if err := cn.nc.Close(); err != nil && ret == nil {
+			ret = err
+		}
+	}
+	return ret
+}
+
 func (c *Client) WarmUpPool() int {
 	var connReleasedWg, wg, connAcquired sync.WaitGroup
 	var connsCreated int
