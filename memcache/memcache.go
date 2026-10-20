@@ -61,6 +61,10 @@ var (
 
 	// ErrNoServers is returned when no servers are configured or available.
 	ErrNoServers = errors.New("memcache: no servers configured or available")
+
+	// ErrConnectionBroken is returned without dialing when the server has
+	// failed FailureThreshold dials in a row and is being backed off.
+	ErrConnectionBroken = errors.New("memcache: connection to server is broken, backing off")
 )
 
 const (
@@ -70,6 +74,12 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+
+	// DefaultBaseBackoff is the default first backoff for a failing server.
+	DefaultBaseBackoff = 1 * time.Second
+
+	// DefaultMaxBackoff is the default cap on a failing server's backoff.
+	DefaultMaxBackoff = 60 * time.Second
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -149,10 +159,24 @@ type Client struct {
 	// be set to a number higher than your peak parallel requests.
 	MaxIdleConns int
 
+	// FailureThreshold is the number of consecutive failed dials to a server
+	// after which new dials to it are skipped (returning ErrConnectionBroken)
+	// for a backoff period. If zero, backoff is disabled.
+	FailureThreshold int
+
+	// BaseBackoff is the first backoff for a failing server; each further
+	// failed dial doubles it. If zero, DefaultBaseBackoff is used.
+	BaseBackoff time.Duration
+
+	// MaxBackoff caps a failing server's backoff. If zero, DefaultMaxBackoff
+	// is used.
+	MaxBackoff time.Duration
+
 	selector ServerSelector
 
 	lk        sync.Mutex
 	freeconn  map[string][]*conn
+	backoffs  map[string]*nodeBackoff
 	TlsConfig *tls.Config
 }
 
@@ -299,7 +323,17 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 		cn.extendDeadline()
 		return cn, nil
 	}
+	var backoff *nodeBackoff
+	if c.FailureThreshold > 0 {
+		backoff = c.nodeBackoff(addr)
+		if !backoff.allow() {
+			return nil, ErrConnectionBroken
+		}
+	}
 	nc, err := c.dial(addr)
+	if backoff != nil {
+		backoff.record(err != nil)
+	}
 	if err != nil {
 		return nil, err
 	}
